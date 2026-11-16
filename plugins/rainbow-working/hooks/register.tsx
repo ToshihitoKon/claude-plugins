@@ -34,10 +34,51 @@ function rainbowHueDeg(cyclePosition: number): number {
   return start + (end - start) * (scaled - index)
 }
 
+function hueDistanceDeg(a: number, b: number): number {
+  const diff = Math.abs((((a - b) % 360) + 360) % 360)
+  return Math.min(diff, 360 - diff)
+}
+
+function srgbToHex(rgb: readonly number[]): string {
+  return `#${rgb.map(v => Math.round(v * 255).toString(16).padStart(2, '0')).join('')}`
+}
+
 function linearToSrgb(value: number): number {
   // sRGB で表せない色は各チャンネルを切り詰める
   const clamped = Math.min(1, Math.max(0, value))
   return clamped <= 0.0031308 ? 12.92 * clamped : 1.055 * clamped ** (1 / 2.4) - 0.055
+}
+
+function srgbToLinear(value: number): number {
+  return value <= 0.04045 ? value / 12.92 : ((value + 0.055) / 1.055) ** 2.4
+}
+
+function hslToSrgb(hueDeg: number, lightness: number): readonly number[] {
+  const chroma = 1 - Math.abs(2 * lightness - 1)
+  const h = (((hueDeg % 360) + 360) % 360) / 60
+  const x = chroma * (1 - Math.abs((h % 2) - 1))
+  const [r, g, b] =
+    h < 1 ? [chroma, x, 0]
+    : h < 2 ? [x, chroma, 0]
+    : h < 3 ? [0, chroma, x]
+    : h < 4 ? [0, x, chroma]
+    : h < 5 ? [x, 0, chroma]
+    : [chroma, 0, x]
+  const m = lightness - chroma / 2
+
+  return [r + m, g + m, b + m]
+}
+
+// 係数は OKLab の定義 (Björn Ottosson) のもの
+function srgbToOklchHueDeg(rgb: readonly number[]): number {
+  const [r, g, b] = rgb.map(srgbToLinear) as [number, number, number]
+  const l = Math.cbrt(0.4122214708 * r + 0.5363325363 * g + 0.0514459929 * b)
+  const m = Math.cbrt(0.2119034982 * r + 0.6806995451 * g + 0.1073969566 * b)
+  const s = Math.cbrt(0.0883024619 * r + 0.2817188376 * g + 0.6299787005 * b)
+  const a = 1.9779984951 * l - 2.428592205 * m + 0.4505937099 * s
+  const bAxis = 0.0259040371 * l + 0.7827717662 * m - 0.808675766 * s
+
+  return (((Math.atan2(bAxis, a) * 180) / Math.PI) % 360 + 360) % 360
 }
 
 // 係数は OKLab の定義 (Björn Ottosson) のもの
@@ -53,48 +94,61 @@ function oklchToHex(lightness: number, chroma: number, hueDeg: number): string {
     -1.2684380046 * l + 2.6097574011 * m - 0.3413193965 * s,
     -0.0041960863 * l - 0.7034186147 * m + 1.707614701 * s,
   ]
-  const toHex = (v: number) => Math.round(linearToSrgb(v) * 255).toString(16).padStart(2, '0')
-
-  return `#${linearRgb.map(toHex).join('')}`
+  return srgbToHex(linearRgb.map(linearToSrgb))
 }
 
-// 描画のたびに OKLCH を変換しないよう、15° 刻みの 24 色を読み込み時に作っておく
-function buildRainbowColors(lightness: number, chroma: number): readonly string[] {
+// 描画のたびに色を変換しないよう、15° 刻みの 24 色を読み込み時に作っておく
+function buildOklchRainbowColors(lightness: number, chroma: number): readonly string[] {
   return Array.from({ length: HUE_STEP_COUNT }, (_, step) =>
     oklchToHex(lightness, chroma, rainbowHueDeg(step / HUE_STEP_COUNT)),
   )
 }
 
-// 明度 0.70・彩度 0.15: 明度 0.75 では青が水色寄りに見えたため少し下げ、彩度を上げて鮮やかさを保つ
-const RAINBOW_COLORS = buildRainbowColors(0.7, 0.15)
-// 網掛けの隙間を埋める色。文字色の 2/3 ほどの明るさにして、粒が見える程度の差を残す
-const RAINBOW_SHADE_COLORS = buildRainbowColors(0.47, 0.11)
+// HSL の原色の中から、各段の OKLCH 色相に一番近いものを選ぶ。OKLCH で彩度を固定すると
+// sRGB に収まる範囲に抑えられておとなしくなるため、色の並びだけ OKLCH に合わせて鮮やかさは HSL の原色を使う
+function buildVividRainbowColors(hslLightness: number): readonly string[] {
+  // 0.25° 刻み: 15° 刻みの 24 段に対して、隣の段と取り違えない程度に細かく、読み込み時の計算も軽い
+  const searchStepDeg = 0.25
+  const candidates = Array.from({ length: 360 / searchStepDeg }, (_, i) => {
+    const rgb = hslToSrgb(i * searchStepDeg, hslLightness)
+    return { rgb, oklchHueDeg: srgbToOklchHueDeg(rgb) }
+  })
 
-type RainbowColors = { colors: readonly string[]; backgroundColors?: readonly string[] }
-type BandStyle = RainbowColors & { glyph: string }
-
-// 背景色を付けないと網掛けの隙間からターミナルの地の色が透けて暗くなるため、同系色で埋めて 2 色を重ねる
-const WORKING_BAND: BandStyle = {
-  glyph: '▓',
-  colors: RAINBOW_COLORS,
-  backgroundColors: RAINBOW_SHADE_COLORS,
+  return Array.from({ length: HUE_STEP_COUNT }, (_, step) => {
+    const targetHueDeg = rainbowHueDeg(step / HUE_STEP_COUNT)
+    const nearest = candidates.reduce((best, candidate) =>
+      hueDistanceDeg(candidate.oklchHueDeg, targetHueDeg) < hueDistanceDeg(best.oklchHueDeg, targetHueDeg)
+        ? candidate
+        : best,
+    )
+    return srgbToHex(nearest.rgb)
+  })
 }
-// 裏のエージェントだけの間は、地の色を透かして暗く見せる。明度を下げる方式は虹の色の差が潰れたため採らない
-const BACKGROUND_BAND: BandStyle = { glyph: '░', colors: RAINBOW_COLORS }
-const SPINNER_COLORS: RainbowColors = { colors: RAINBOW_COLORS }
+
+// 明度 0.55: 0.5 だと青・紫が暗い背景に沈むため少し持ち上げる
+const VIVID_RAINBOW_COLORS = buildVividRainbowColors(0.55)
+// 明度 0.70・彩度 0.15: 明度 0.75 では青が水色寄りに見えたため少し下げ、彩度を上げて鮮やかさを保つ
+const SOFT_RAINBOW_COLORS = buildOklchRainbowColors(0.7, 0.15)
+
+type BandStyle = { glyph: string; colors: readonly string[] }
+
+const WORKING_BAND: BandStyle = { glyph: '█', colors: VIVID_RAINBOW_COLORS }
+// 裏のエージェントだけの間は、網掛けの隙間から地の色を透かして暗く見せる。
+// 明度を下げる方式は虹の色の差が潰れたため採らない
+const BACKGROUND_BAND: BandStyle = { glyph: '░', colors: SOFT_RAINBOW_COLORS }
 
 function quantizedHueStep(position: number, huePerPosition: number, tick: number): number {
   const hue = position * huePerPosition - tick * HUE_PER_TICK
   return Math.floor((((hue % 360) + 360) % 360) / HUE_QUANTUM)
 }
 
-type Run = { text: string; color: string; backgroundColor?: string }
+type Run = { text: string; color: string }
 
 function rainbowRuns(
   text: string,
   tick: number,
   huePerPosition: number,
-  { colors, backgroundColors }: RainbowColors,
+  colors: readonly string[],
   positionOffset = 0,
 ): Run[] {
   const runs: Run[] = []
@@ -110,7 +164,7 @@ function rainbowRuns(
     }
 
     currentStep = step
-    runs.push({ text: char, color: colors[step]!, backgroundColor: backgroundColors?.[step] })
+    runs.push({ text: char, color: colors[step]! })
   })
 
   return runs
@@ -241,8 +295,8 @@ export const register: Register = on => {
     const line = band.glyph.repeat(e.props.bodyColumns)
     const drawRow = (offset: number) => (
       <Text>
-        {rainbowRuns(line, anim.tick, BAND_HUE_PER_CELL, band, offset).map(run => (
-          <Text color={run.color} backgroundColor={run.backgroundColor}>{run.text}</Text>
+        {rainbowRuns(line, anim.tick, BAND_HUE_PER_CELL, band.colors, offset).map(run => (
+          <Text color={run.color}>{run.text}</Text>
         ))}
       </Text>
     )
@@ -268,9 +322,9 @@ export const register: Register = on => {
 
     return (
       <Text>
-        <Text color={RAINBOW_COLORS[quantizedHueStep(0, 0, anim.tick)]}>{glyph} </Text>
+        <Text color={VIVID_RAINBOW_COLORS[quantizedHueStep(0, 0, anim.tick)]}>{glyph} </Text>
         <Text bold>
-          {rainbowRuns(`${label}${suffix}`, anim.tick, WORD_HUE_PER_CHAR, SPINNER_COLORS).map(run => (
+          {rainbowRuns(`${label}${suffix}`, anim.tick, WORD_HUE_PER_CHAR, VIVID_RAINBOW_COLORS).map(run => (
             <Text color={run.color}>{run.text}</Text>
           ))}
         </Text>
