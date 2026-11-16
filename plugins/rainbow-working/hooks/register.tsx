@@ -1,4 +1,4 @@
-import type { Register, Timer } from 'claude-code'
+import type { AgentStatus, EngineInterface, Register, Timer } from 'claude-code'
 
 // 200ms（毎秒 5 回）: ui.render の再描画上限（毎秒 10 回）の半分に抑え、目で追える程度の流れにする
 const TICK_MS = 200
@@ -15,11 +15,18 @@ const SECOND_ROW_OFFSET_CELLS = 6
 const BLOCK = '█'
 const GLYPH_FRAMES = ['·', '✢', '✳', '✶', '✻', '✽', '✻', '✶', '✳', '✢']
 const ELLIPSIS = '…'
+// 明度 55%: 50% だと青・紫が暗い背景に沈むため少し持ち上げる
+const WORKING_LIGHTNESS = 0.55
+// 裏のエージェントだけが動いている間は暗くして、メインが入力待ちであることを見分けられるようにする。
+// 0.3 では明るすぎて区別しにくかったため、サンプルを見比べて 0.13 にした
+const BACKGROUND_LIGHTNESS = 0.13
+// turn.complete を取りこぼしても 15 秒以内に止める。$.agent.list() は軽いため短めにしている
+const AGENT_CHECK_MS = 15_000
+// waiting は自分の裏の作業や計画の承認を待っている状態で、エージェントとしてはまだ終わっていない
+const ALIVE_AGENT_STATUSES: ReadonlySet<AgentStatus> = new Set(['pending', 'running', 'waiting'])
 
-function hueToHex(hueDeg: number): string {
-  // 彩度 100%・明度 55%: 50% だと青・紫が暗い背景に沈むため少し持ち上げる
+function hueToHex(hueDeg: number, lightness = WORKING_LIGHTNESS): string {
   const saturation = 1
-  const lightness = 0.55
   const chroma = (1 - Math.abs(2 * lightness - 1)) * saturation
   const h = (((hueDeg % 360) + 360) % 360) / 60
   const x = chroma * (1 - Math.abs((h % 2) - 1))
@@ -44,7 +51,13 @@ function quantizedHue(position: number, huePerPosition: number, tick: number): n
 
 type Run = { text: string; color: string }
 
-function rainbowRuns(text: string, tick: number, huePerPosition: number, positionOffset = 0): Run[] {
+function rainbowRuns(
+  text: string,
+  tick: number,
+  huePerPosition: number,
+  positionOffset = 0,
+  lightness = WORKING_LIGHTNESS,
+): Run[] {
   const runs: Run[] = []
   let currentHue: number | undefined
 
@@ -58,7 +71,7 @@ function rainbowRuns(text: string, tick: number, huePerPosition: number, positio
     }
 
     currentHue = hue
-    runs.push({ text: char, color: hueToHex(hue) })
+    runs.push({ text: char, color: hueToHex(hue, lightness) })
   })
 
   return runs
@@ -71,59 +84,125 @@ function formatElapsed(ms: number): string {
   return min > 0 ? `${min}m ${sec}s` : `${sec}s`
 }
 
-export const register: Register = on => {
-  let tick = 0
-  let ticker: Timer | undefined
-  let turnStartedAtMs = 0
-  let nowMs = 0
+type Animation = {
+  tick: number
+  ticker: Timer | undefined
+  agentChecker: Timer | undefined
+  isMainWorking: boolean
+  agentTurnIds: Set<string>
+  turnStartedAtMs: number
+  nowMs: number
+}
 
-  const stopTicker = () => {
-    ticker?.cancel()
-    ticker = undefined
+function hasAgentTurns(anim: Animation): boolean {
+  return anim.agentTurnIds.size > 0
+}
+
+function stopAnimationIfIdle(anim: Animation): void {
+  if (anim.isMainWorking || hasAgentTurns(anim)) {
+    return
+  }
+
+  anim.ticker?.cancel()
+  anim.ticker = undefined
+  anim.agentChecker?.cancel()
+  anim.agentChecker = undefined
+}
+
+// turn.complete を取りこぼしたエージェントのターンが残り続けないよう、一覧で裏付けを取る
+async function dropAgentTurnsIfNoneAlive($: EngineInterface, anim: Animation): Promise<void> {
+  if (!hasAgentTurns(anim)) {
+    return
+  }
+
+  const agents = await $.agent.list()
+  if (agents.some(agent => ALIVE_AGENT_STATUSES.has(agent.status))) {
+    return
+  }
+
+  anim.agentTurnIds.clear()
+  stopAnimationIfIdle(anim)
+  $.ui.invalidate('ui.render')
+}
+
+function startAnimation($: EngineInterface, anim: Animation): void {
+  if (anim.ticker !== undefined) {
+    return
+  }
+
+  anim.ticker = $.clock.every(TICK_MS, () => {
+    anim.tick += 1
+    // 描画中の $ 呼び出しを避けるため、現在時刻はタイマー側で取っておく
+    void $.clock.now().then(now => {
+      anim.nowMs = now
+      $.ui.invalidate('ui.render')
+    })
+  })
+  anim.agentChecker = $.clock.every(AGENT_CHECK_MS, () => {
+    void dropAgentTurnsIfNoneAlive($, anim)
+  })
+}
+
+export const register: Register = on => {
+  const anim: Animation = {
+    tick: 0,
+    ticker: undefined,
+    agentChecker: undefined,
+    isMainWorking: false,
+    agentTurnIds: new Set(),
+    turnStartedAtMs: 0,
+    nowMs: 0,
   }
 
   on('turn.start', async ($, e, next) => {
-    if (e.agentId === undefined && ticker === undefined) {
-      turnStartedAtMs = await $.clock.now()
-      nowMs = turnStartedAtMs
-      ticker = $.clock.every(TICK_MS, () => {
-        tick += 1
-        // 描画中の $ 呼び出しを避けるため、現在時刻はタイマー側で取っておく
-        void $.clock.now().then(now => {
-          nowMs = now
-          $.ui.invalidate('ui.render')
-        })
-      })
+    if (e.agentId !== undefined) {
+      anim.agentTurnIds.add(e.turnId)
+      startAnimation($, anim)
+      return next(e)
     }
+
+    if (!anim.isMainWorking) {
+      anim.turnStartedAtMs = await $.clock.now()
+      anim.nowMs = anim.turnStartedAtMs
+      anim.isMainWorking = true
+    }
+    startAnimation($, anim)
 
     return next(e)
   })
 
   on('turn.complete', ($, e, next) => {
-    if (e.agentId === undefined) {
-      stopTicker()
+    if (e.agentId !== undefined) {
+      anim.agentTurnIds.delete(e.turnId)
+    } else {
+      anim.isMainWorking = false
     }
+    stopAnimationIfIdle(anim)
+    // タイマーが止まると再描画が起きず、入力待ち中は暗い帯が残ってしまうため、最後に 1 回描き直す
+    $.ui.invalidate('ui.render')
 
     return next(e)
   })
 
   on('ui.render', { component: 'AbovePrompt' }, ($, e, next) => {
-    // 中断などで turn.complete を取りこぼしても、入力待ちに戻った時点でタイマーを止める
+    // 中断などで turn.complete を取りこぼしても、入力待ちに戻った時点でメインの分は止める
     if (!e.props.isWorking) {
-      stopTicker()
+      anim.isMainWorking = false
+      stopAnimationIfIdle(anim)
     }
 
-    const isHidden =
-      e.surface !== 'terminal' || !e.props.isWorking || e.props.hasSurvey
+    const isRunning = e.props.isWorking || hasAgentTurns(anim)
+    const isHidden = e.surface !== 'terminal' || !isRunning || e.props.hasSurvey
     if (isHidden) {
       return next(e)
     }
 
+    const lightness = e.props.isWorking ? WORKING_LIGHTNESS : BACKGROUND_LIGHTNESS
     const { Box, Text } = $.ui.resolve(e)
     const line = BLOCK.repeat(e.props.bodyColumns)
     const drawRow = (offset: number) => (
       <Text>
-        {rainbowRuns(line, tick, BAND_HUE_PER_CELL, offset).map(run => (
+        {rainbowRuns(line, anim.tick, BAND_HUE_PER_CELL, offset, lightness).map(run => (
           <Text color={run.color}>{run.text}</Text>
         ))}
       </Text>
@@ -145,18 +224,18 @@ export const register: Register = on => {
 
     const label = e.props.message ?? e.props.word
     const suffix = label.endsWith(ELLIPSIS) ? '' : e.props.suffix
-    const glyph = GLYPH_FRAMES[tick % GLYPH_FRAMES.length]
+    const glyph = GLYPH_FRAMES[anim.tick % GLYPH_FRAMES.length]
     const { Text } = $.ui.resolve(e)
 
     return (
       <Text>
-        <Text color={hueToHex(quantizedHue(0, 0, tick))}>{glyph} </Text>
+        <Text color={hueToHex(quantizedHue(0, 0, anim.tick))}>{glyph} </Text>
         <Text bold>
-          {rainbowRuns(`${label}${suffix}`, tick, WORD_HUE_PER_CHAR).map(run => (
+          {rainbowRuns(`${label}${suffix}`, anim.tick, WORD_HUE_PER_CHAR).map(run => (
             <Text color={run.color}>{run.text}</Text>
           ))}
         </Text>
-        <Text dimColor> ({formatElapsed(nowMs - turnStartedAtMs)} · {e.props.mode})</Text>
+        <Text dimColor> ({formatElapsed(anim.nowMs - anim.turnStartedAtMs)} · {e.props.mode})</Text>
       </Text>
     )
   })
