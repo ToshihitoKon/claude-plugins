@@ -1,0 +1,12 @@
+{
+  "name": "toshihitokon",
+  "owner": { "name": "ToshihitoKon" },
+  "metadata": { "description": "ToshihitoKon's Claude Code plugins" },
+  "plugins": [
+    {
+      "name": "rainbow-working",
+      "source": "./plugins/rainbow-working",
+      "description": "Shows a flowing rainbow band above the prompt and a rainbow spinner word while Claude is working"
+    }
+  ]
+}

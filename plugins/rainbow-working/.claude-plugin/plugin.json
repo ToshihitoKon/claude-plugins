@@ -1,0 +1,8 @@
+{
+  "name": "rainbow-working",
+  "version": "0.1.0",
+  "description": "Shows a flowing rainbow band above the prompt and a rainbow spinner word while Claude is working",
+  "author": { "name": "ToshihitoKon" },
+  "license": "MIT",
+  "repository": "https://github.com/ToshihitoKon/claude-plugins"
+}
