@@ -6,6 +6,8 @@ ToshihitoKon's Claude Code plugin marketplace.
 
 - [rainbow-working](plugins/rainbow-working/): shows a flowing rainbow band above the prompt and a rainbow spinner word while Claude is working, so you can tell from a distance that a turn is running.
 
+  ![rainbow-working while Claude is working](plugins/rainbow-working/screenshot.webp)
+
 ## Install
 
 At the prompt of a terminal session:

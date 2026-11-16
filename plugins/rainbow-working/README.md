@@ -2,6 +2,8 @@
 
 A Claude Code mod that makes it obvious from across the room that Claude is working.
 
+![rainbow-working while Claude is working](screenshot.webp)
+
 While a turn is running in the terminal:
 
 - a two-row rainbow band flows above the prompt input
