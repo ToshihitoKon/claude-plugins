@@ -9,7 +9,9 @@ While a turn is running in the terminal:
 - a two-row rainbow band flows above the prompt input
 - the spinner line is redrawn with its word in rainbow colors, followed by the elapsed time and the current mode (`thinking`, `tool-use`, ...)
 
-When Claude is back at the prompt but background agents (subagents, teammates) are still running, the band keeps flowing in darker colors. Every 15 seconds the mod checks the session's agent list; if none of them is running, it clears the band, so it stops within 15 seconds even if it missed an agent's end. Workflow agents are not in that list, so the darker band for a Workflow running alone in the background stops within 15 seconds and comes back when its next agent starts.
+The band uses fully saturated colors, spaced by how the hues look rather than by equal HSL angles: each step picks the saturated color closest to a target hue in the OKLCH color space, and the targets are spread evenly over named colors (red, orange, yellow, green, cyan, sky blue, blue, indigo, magenta). This smooths the jumps around orange and blue and gives blue a wider share of the band.
+
+When Claude is back at the prompt but background agents (subagents, teammates) are still running, the band keeps flowing as a `░` pattern in softer OKLCH colors (lightness 0.70, chroma 0.15), so it looks darker. Every 15 seconds the mod checks the session's agent list; if none of them is running, it clears the band, so it stops within 15 seconds even if it missed an agent's end. Workflow agents are not in that list, so the `░` band for a Workflow running alone in the background stops within 15 seconds and comes back when its next agent starts.
 
 When Claude is waiting for your input and no agent is running, nothing extra is drawn and the animation timers are stopped.
 

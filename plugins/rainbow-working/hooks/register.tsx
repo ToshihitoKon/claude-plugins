@@ -10,24 +10,51 @@ const BAND_HUE_PER_CELL = 4
 const WORD_HUE_PER_CHAR = 30
 // 色相を 15° 刻みに丸めて同色の連続セルを 1 つの Text にまとめ、要素数を列数の 1/4 程度に減らす
 const HUE_QUANTUM = 15
+const HUE_STEP_COUNT = 360 / HUE_QUANTUM
 // 2 行目を左にずらし、斜めに流れる波に見せる
 const SECOND_ROW_OFFSET_CELLS = 6
-const BLOCK = '█'
 const GLYPH_FRAMES = ['·', '✢', '✳', '✶', '✻', '✽', '✻', '✶', '✳', '✢']
 const ELLIPSIS = '…'
-// 明度 55%: 50% だと青・紫が暗い背景に沈むため少し持ち上げる
-const WORKING_LIGHTNESS = 0.55
-// 裏のエージェントだけが動いている間は暗くして、メインが入力待ちであることを見分けられるようにする。
-// 0.3 では明るすぎて区別しにくかったため、サンプルを見比べて 0.13 にした
-const BACKGROUND_LIGHTNESS = 0.13
 // turn.complete を取りこぼしても 15 秒以内に止める。$.agent.list() は軽いため短めにしている
 const AGENT_CHECK_MS = 15_000
 // waiting は自分の裏の作業や計画の承認を待っている状態で、エージェントとしてはまだ終わっていない
 const ALIVE_AGENT_STATUSES: ReadonlySet<AgentStatus> = new Set(['pending', 'running', 'waiting'])
 
-function hueToHex(hueDeg: number, lightness = WORKING_LIGHTNESS): string {
-  const saturation = 1
-  const chroma = (1 - Math.abs(2 * lightness - 1)) * saturation
+// OKLCH の色相角を等間隔に回すと青の幅が狭く見えるため、基準色ごとに同じ幅を割り当てる。
+// 赤・オレンジ・黄・緑・シアン・空色・青・藍・マゼンタの OKLCH 色相角
+const HUE_ANCHORS_DEG = [29, 60, 105, 142, 195, 235, 264, 285, 328]
+
+function rainbowHueDeg(cyclePosition: number): number {
+  const scaled = cyclePosition * HUE_ANCHORS_DEG.length
+  const index = Math.floor(scaled)
+  const start = HUE_ANCHORS_DEG[index]!
+  const next = HUE_ANCHORS_DEG[(index + 1) % HUE_ANCHORS_DEG.length]!
+  const end = next > start ? next : next + 360
+
+  return start + (end - start) * (scaled - index)
+}
+
+function hueDistanceDeg(a: number, b: number): number {
+  const diff = Math.abs((((a - b) % 360) + 360) % 360)
+  return Math.min(diff, 360 - diff)
+}
+
+function srgbToHex(rgb: readonly number[]): string {
+  return `#${rgb.map(v => Math.round(v * 255).toString(16).padStart(2, '0')).join('')}`
+}
+
+function linearToSrgb(value: number): number {
+  // sRGB で表せない色は各チャンネルを切り詰める
+  const clamped = Math.min(1, Math.max(0, value))
+  return clamped <= 0.0031308 ? 12.92 * clamped : 1.055 * clamped ** (1 / 2.4) - 0.055
+}
+
+function srgbToLinear(value: number): number {
+  return value <= 0.04045 ? value / 12.92 : ((value + 0.055) / 1.055) ** 2.4
+}
+
+function hslToSrgb(hueDeg: number, lightness: number): readonly number[] {
+  const chroma = 1 - Math.abs(2 * lightness - 1)
   const h = (((hueDeg % 360) + 360) % 360) / 60
   const x = chroma * (1 - Math.abs((h % 2) - 1))
   const [r, g, b] =
@@ -38,15 +65,81 @@ function hueToHex(hueDeg: number, lightness = WORKING_LIGHTNESS): string {
     : h < 5 ? [x, 0, chroma]
     : [chroma, 0, x]
   const m = lightness - chroma / 2
-  const toHex = (v: number) =>
-    Math.round((v + m) * 255).toString(16).padStart(2, '0')
 
-  return `#${toHex(r)}${toHex(g)}${toHex(b)}`
+  return [r + m, g + m, b + m]
 }
 
-function quantizedHue(position: number, huePerPosition: number, tick: number): number {
+// 係数は OKLab の定義 (Björn Ottosson) のもの
+function srgbToOklchHueDeg(rgb: readonly number[]): number {
+  const [r, g, b] = rgb.map(srgbToLinear) as [number, number, number]
+  const l = Math.cbrt(0.4122214708 * r + 0.5363325363 * g + 0.0514459929 * b)
+  const m = Math.cbrt(0.2119034982 * r + 0.6806995451 * g + 0.1073969566 * b)
+  const s = Math.cbrt(0.0883024619 * r + 0.2817188376 * g + 0.6299787005 * b)
+  const a = 1.9779984951 * l - 2.428592205 * m + 0.4505937099 * s
+  const bAxis = 0.0259040371 * l + 0.7827717662 * m - 0.808675766 * s
+
+  return (((Math.atan2(bAxis, a) * 180) / Math.PI) % 360 + 360) % 360
+}
+
+// 係数は OKLab の定義 (Björn Ottosson) のもの
+function oklchToHex(lightness: number, chroma: number, hueDeg: number): string {
+  const hueRad = (hueDeg * Math.PI) / 180
+  const a = chroma * Math.cos(hueRad)
+  const b = chroma * Math.sin(hueRad)
+  const l = (lightness + 0.3963377774 * a + 0.2158037573 * b) ** 3
+  const m = (lightness - 0.1055613458 * a - 0.0638541728 * b) ** 3
+  const s = (lightness - 0.0894841775 * a - 1.291485548 * b) ** 3
+  const linearRgb = [
+    4.0767416621 * l - 3.3077115913 * m + 0.2309699292 * s,
+    -1.2684380046 * l + 2.6097574011 * m - 0.3413193965 * s,
+    -0.0041960863 * l - 0.7034186147 * m + 1.707614701 * s,
+  ]
+  return srgbToHex(linearRgb.map(linearToSrgb))
+}
+
+// 描画のたびに色を変換しないよう、15° 刻みの 24 色を読み込み時に作っておく
+function buildOklchRainbowColors(lightness: number, chroma: number): readonly string[] {
+  return Array.from({ length: HUE_STEP_COUNT }, (_, step) =>
+    oklchToHex(lightness, chroma, rainbowHueDeg(step / HUE_STEP_COUNT)),
+  )
+}
+
+// HSL の原色の中から、各段の OKLCH 色相に一番近いものを選ぶ。OKLCH で彩度を固定すると
+// sRGB に収まる範囲に抑えられておとなしくなるため、色の並びだけ OKLCH に合わせて鮮やかさは HSL の原色を使う
+function buildVividRainbowColors(hslLightness: number): readonly string[] {
+  // 0.25° 刻み: 15° 刻みの 24 段に対して、隣の段と取り違えない程度に細かく、読み込み時の計算も軽い
+  const searchStepDeg = 0.25
+  const candidates = Array.from({ length: 360 / searchStepDeg }, (_, i) => {
+    const rgb = hslToSrgb(i * searchStepDeg, hslLightness)
+    return { rgb, oklchHueDeg: srgbToOklchHueDeg(rgb) }
+  })
+
+  return Array.from({ length: HUE_STEP_COUNT }, (_, step) => {
+    const targetHueDeg = rainbowHueDeg(step / HUE_STEP_COUNT)
+    const nearest = candidates.reduce((best, candidate) =>
+      hueDistanceDeg(candidate.oklchHueDeg, targetHueDeg) < hueDistanceDeg(best.oklchHueDeg, targetHueDeg)
+        ? candidate
+        : best,
+    )
+    return srgbToHex(nearest.rgb)
+  })
+}
+
+// 明度 0.55: 0.5 だと青・紫が暗い背景に沈むため少し持ち上げる
+const VIVID_RAINBOW_COLORS = buildVividRainbowColors(0.55)
+// 明度 0.70・彩度 0.15: 明度 0.75 では青が水色寄りに見えたため少し下げ、彩度を上げて鮮やかさを保つ
+const SOFT_RAINBOW_COLORS = buildOklchRainbowColors(0.7, 0.15)
+
+type BandStyle = { glyph: string; colors: readonly string[] }
+
+const WORKING_BAND: BandStyle = { glyph: '█', colors: VIVID_RAINBOW_COLORS }
+// 裏のエージェントだけの間は、網掛けの隙間から地の色を透かして暗く見せる。
+// 明度を下げる方式は虹の色の差が潰れたため採らない
+const BACKGROUND_BAND: BandStyle = { glyph: '░', colors: SOFT_RAINBOW_COLORS }
+
+function quantizedHueStep(position: number, huePerPosition: number, tick: number): number {
   const hue = position * huePerPosition - tick * HUE_PER_TICK
-  return Math.floor((((hue % 360) + 360) % 360) / HUE_QUANTUM) * HUE_QUANTUM
+  return Math.floor((((hue % 360) + 360) % 360) / HUE_QUANTUM)
 }
 
 type Run = { text: string; color: string }
@@ -55,23 +148,23 @@ function rainbowRuns(
   text: string,
   tick: number,
   huePerPosition: number,
+  colors: readonly string[],
   positionOffset = 0,
-  lightness = WORKING_LIGHTNESS,
 ): Run[] {
   const runs: Run[] = []
-  let currentHue: number | undefined
+  let currentStep: number | undefined
 
   Array.from(text).forEach((char, i) => {
-    const hue = quantizedHue(i + positionOffset, huePerPosition, tick)
+    const step = quantizedHueStep(i + positionOffset, huePerPosition, tick)
     const last = runs[runs.length - 1]
 
-    if (last !== undefined && hue === currentHue) {
+    if (last !== undefined && step === currentStep) {
       last.text += char
       return
     }
 
-    currentHue = hue
-    runs.push({ text: char, color: hueToHex(hue, lightness) })
+    currentStep = step
+    runs.push({ text: char, color: colors[step]! })
   })
 
   return runs
@@ -197,12 +290,12 @@ export const register: Register = on => {
       return next(e)
     }
 
-    const lightness = e.props.isWorking ? WORKING_LIGHTNESS : BACKGROUND_LIGHTNESS
+    const band = e.props.isWorking ? WORKING_BAND : BACKGROUND_BAND
     const { Box, Text } = $.ui.resolve(e)
-    const line = BLOCK.repeat(e.props.bodyColumns)
+    const line = band.glyph.repeat(e.props.bodyColumns)
     const drawRow = (offset: number) => (
       <Text>
-        {rainbowRuns(line, anim.tick, BAND_HUE_PER_CELL, offset, lightness).map(run => (
+        {rainbowRuns(line, anim.tick, BAND_HUE_PER_CELL, band.colors, offset).map(run => (
           <Text color={run.color}>{run.text}</Text>
         ))}
       </Text>
@@ -229,9 +322,9 @@ export const register: Register = on => {
 
     return (
       <Text>
-        <Text color={hueToHex(quantizedHue(0, 0, anim.tick))}>{glyph} </Text>
+        <Text color={VIVID_RAINBOW_COLORS[quantizedHueStep(0, 0, anim.tick)]}>{glyph} </Text>
         <Text bold>
-          {rainbowRuns(`${label}${suffix}`, anim.tick, WORD_HUE_PER_CHAR).map(run => (
+          {rainbowRuns(`${label}${suffix}`, anim.tick, WORD_HUE_PER_CHAR, VIVID_RAINBOW_COLORS).map(run => (
             <Text color={run.color}>{run.text}</Text>
           ))}
         </Text>
